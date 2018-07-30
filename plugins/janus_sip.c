@@ -4600,7 +4600,7 @@ static void *janus_sip_relay_thread(void *data) {
 					/* Save the frame if we're recording */
 					janus_recorder_save_frame(session->arc_peer, buffer, opusLen + 12);
 					/* Relay to browser */
-					JANUS_LOG(LOG_VERB, "Relay packet Audio : SSRC=%"SCNu32" , seq=%"SCNu16" , ts=%"SCNu32" \n",  ssrc , ntohs(header->seq_number) , ntohl(header->timestamp) );
+					JANUS_LOG(LOG_VERB, "Relay packet Audio : SSRC=%"SCNu32" , seq=%"SCNu16" , ts=%"SCNu32" \n", ntohl(header->ssrc) , ntohs(header->seq_number) , ntohl(header->timestamp) );
 					gateway->relay_rtp(session->handle, 0, buffer, opusLen + 12);
 					continue;
 				} else if(session->media.audio_rtcp_fd != -1 && fds[i].fd == session->media.audio_rtcp_fd) {
