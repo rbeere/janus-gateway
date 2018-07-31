@@ -3770,6 +3770,18 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			gboolean changed = FALSE;
 			gboolean update = session->media.ready;
 			janus_sip_sdp_process(session, sdp, TRUE, update, &changed);
+			GList *temp = sdp->m_lines;
+			while(temp) {
+				janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
+				if(m->type == JANUS_SDP_AUDIO) {
+					m->ptypes = g_list_append(m->ptypes, GINT_TO_POINTER(96));
+					m->attributes = g_list_append(m->attributes, janus_sdp_attribute_create("rtpmap" ,  "96 opus/48000/2"));
+					m->attributes = g_list_append(m->attributes, janus_sdp_attribute_create("fmtp" , "96 maxplaybackrate=8000; stereo=0; sprop-stereo=0; useinbandfec=0"));
+				}
+				temp = temp->next;
+			}
+			janus_sdp_remove_payload_type( sdp , 8);
+			
 			/* If we asked for SRTP and are not getting it, fail */
 			if(session->media.require_srtp && !session->media.has_srtp_remote) {
 				JANUS_LOG(LOG_ERR, "\tWe asked for mandatory SRTP but didn't get any in the reply!\n");
@@ -3828,7 +3840,7 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			/* Send event back to the browser */
 			json_t *jsep = NULL;
 			if(!session->media.earlymedia) {
-				jsep = json_pack("{ssss}", "type", "answer", "sdp", fixed_sdp);
+				jsep = json_pack("{ssss}", "type", "answer", "sdp", janus_sdp_write(sdp) /*fixed_sdp*/);
 			} else {
 				/* We've received the 200 OK after the 183, we can remove the flag now */
 				session->media.earlymedia = FALSE;
