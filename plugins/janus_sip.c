@@ -3757,7 +3757,14 @@ void janus_sip_sofia_callback(nua_event_t event, int status, char const *phrase,
 			}
 			/* Send an ACK, if needed */
 			if(!in_progress && !session->media.autoack) {
-				char *route = sip->sip_record_route ? url_as_string(session->stack->s_home, sip->sip_record_route->r_url) : NULL;
+				// char *route = sip->sip_record_route ? url_as_string(session->stack->s_home, sip->sip_record_route->r_url) : NULL;
+				char *route = NULL;
+				sip_record_route_t *srr = sip->sip_record_route;
+				if(srr != NULL) {
+					while(srr->r_next != NULL)
+						srr = srr->r_next;
+					route = srr ? url_as_string(session->stack->s_home, srr->r_url) : NULL;
+				}				
 				JANUS_LOG(LOG_INFO, "Sending ACK (route=%s)\n", route ? route : "none");
 				nua_ack(nh,
 					TAG_IF(route, NTATAG_DEFAULT_PROXY(route)),
