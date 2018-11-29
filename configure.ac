@@ -1,4 +1,4 @@
-AC_INIT([Janus Gateway],[0.4.3],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
+AC_INIT([Janus WebRTC Server],[0.6.0],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -15,9 +15,9 @@ AC_PROG_CC
 LT_PREREQ([2.2])
 LT_INIT
 
-JANUS_VERSION=43
+JANUS_VERSION=60
 AC_SUBST(JANUS_VERSION)
-JANUS_VERSION_STRING="0.4.3"
+JANUS_VERSION_STRING="0.6.0"
 AC_SUBST(JANUS_VERSION_STRING)
 
 case "$host_os" in
@@ -75,6 +75,12 @@ AC_ARG_ENABLE([dtls-settimeout],
                               [Use DTLSv1_set_initial_timeout_duration (only available in recent BoringSSL versions)])],
               [],
               [enable_dtls_settimeout=no])
+
+AC_ARG_ENABLE([pthread-mutex],
+              [AS_HELP_STRING([--enable-pthread-mutex],
+                              [Use pthread_mutex instead of GMutex (see #1397)])],
+              [],
+              [enable_pthread_mutex=no])
 
 AC_ARG_ENABLE([turn-rest-api],
               [AS_HELP_STRING([--disable-turn-rest-api],
@@ -142,6 +148,8 @@ AC_ARG_ENABLE([all-handlers],
                      [enable_sample_event_handler=no])
                AS_IF([test "x$enable_rabbitmq_event_handler" != "xyes"],
                      [enable_rabbitmq_event_handler=no])
+               AS_IF([test "x$enable_mqtt_event_handler" != "xyes"],
+                     [enable_mqtt_event_handler=no])
               ],
               [])
 
@@ -212,6 +220,13 @@ AC_ARG_ENABLE([rabbitmq-event-handler],
                      [enable_rabbitmq_event_handler=no])],
               [enable_rabbitmq_event_handler=maybe])
 
+AC_ARG_ENABLE([mqtt-event-handler],
+              [AS_HELP_STRING([--disable-mqtt-event-handler],
+                              [Disable MQTT event handler ])],
+              [AS_IF([test "x$enable_mqtt_event_handler" != "xyes"],
+                     [enable_mqtt_event_handler=no])],
+              [enable_mqtt_event_handler=maybe])
+
 AC_ARG_ENABLE([systemd-sockets],
               [AS_HELP_STRING([--enable-systemd-sockets],
                               [Enable Systemd Unix Sockets management])],
@@ -221,6 +236,7 @@ AC_ARG_ENABLE([systemd-sockets],
 PKG_CHECK_MODULES([JANUS],
                   [
                     glib-2.0 >= $glib_version
+					libconfig
                     nice
                     jansson >= $jansson_version
                     libssl >= $ssl_version
@@ -249,6 +265,13 @@ AS_IF([test "x$enable_dtls_settimeout" = "xyes"],
       AC_MSG_NOTICE([Assuming DTLSv1_set_initial_timeout_duration is available])
       ])
 AM_CONDITIONAL([ENABLE_DTLS_SETTIMEOUT], [test "x$enable_dtls_settimeout" = "xyes"])
+
+AS_IF([test "x$enable_pthread_mutex" = "xyes"],
+      [
+      AC_DEFINE(USE_PTHREAD_MUTEX)
+      AC_MSG_NOTICE([Will use pthread_mutex instead of GMutex])
+      ])
+AM_CONDITIONAL([ENABLE_PTHREAD_MUTEX], [test "x$enable_pthread_mutex" = "xyes"])
 
 AC_SEARCH_LIBS([tls_config_set_ca_mem],[tls],
              [AM_CONDITIONAL([LIBRESSL_DETECTED], true)],
@@ -450,7 +473,6 @@ AC_CHECK_LIB([rabbitmq],
                  AC_DEFINE(HAVE_RABBITMQEVH)
                  enable_rabbitmq_event_handler=yes
                ])
-
              ],
              [
                AS_IF([test "x$enable_rabbitmq" = "xyes"],
@@ -466,10 +488,17 @@ AC_CHECK_LIB([paho-mqtt3a],
                   AC_DEFINE(HAVE_MQTT)
                   enable_mqtt=yes
                ])
+               AS_IF([test "x$enable_mqtt_event_handler" != "xno"],
+               [
+                 AC_DEFINE(HAVE_MQTTEVH)
+                 enable_mqtt_event_handler=yes
+               ])
              ],
              [
                AS_IF([test "x$enable_mqtt" = "xyes"],
                      [AC_MSG_ERROR([paho c client not found. See README.md for installation instructions or use --disable-mqtt])])
+               AS_IF([test "x$enable_mqtt_event_handler" = "xyes"],
+                     [AC_MSG_ERROR([paho c not found. See README.md for installation instructions or use --disable-mqtt-event-handler])])
              ])
 AC_CHECK_LIB([nanomsg],
              [nn_socket],
@@ -487,6 +516,7 @@ AC_CHECK_LIB([nanomsg],
 AM_CONDITIONAL([ENABLE_RABBITMQ], [test "x$enable_rabbitmq" = "xyes"])
 AM_CONDITIONAL([ENABLE_RABBITMQEVH], [test "x$enable_rabbitmq_event_handler" = "xyes"])
 AM_CONDITIONAL([ENABLE_MQTT], [test "x$enable_mqtt" = "xyes"])
+AM_CONDITIONAL([ENABLE_MQTTEVH], [test "x$enable_mqtt_event_handler" = "xyes"])
 AM_CONDITIONAL([ENABLE_NANOMSG], [test "x$enable_nanomsg" = "xyes"])
 
 AC_TRY_COMPILE([
@@ -521,7 +551,7 @@ AS_IF([test "x$enable_systemd_sockets" = "xyes"],
                           [AC_MSG_ERROR([libsystemd not found. systemd unix domain socket service not supported])])
       ])
 
- 
+
 ##
 # Plugins
 ##
@@ -849,6 +879,9 @@ AM_COND_IF([ENABLE_BORINGSSL],
 		[echo "SSL/crypto library:        LibreSSL"],
 		[echo "SSL/crypto library:        OpenSSL"])
 	 echo "DTLS set-timeout:          not available"])
+AM_COND_IF([ENABLE_PTHREAD_MUTEX],
+	[echo "Mutex implementation:      pthread mutex"],
+	[echo "Mutex implementation:      GMutex (native futex on Linux)"])
 AM_COND_IF([ENABLE_SCTP],
 	[echo "DataChannels support:      yes"],
 	[echo "DataChannels support:      no"])
@@ -927,6 +960,9 @@ AM_COND_IF([ENABLE_SAMPLEEVH],
 AM_COND_IF([ENABLE_RABBITMQEVH],
 	[echo "    RabbitMQ event handler:yes"],
 	[echo "    RabbitMQ event handler:no"])
+AM_COND_IF([ENABLE_MQTTEVH],
+	[echo "    MQTT event handler:    yes"],
+	[echo "    MQTT event handler:    no"])
 AM_COND_IF([ENABLE_JAVASCRIPT_MODULES], [
 	echo "JavaScript modules:        yes"
 	echo "    Using npm:             $NPM"

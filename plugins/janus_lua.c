@@ -65,6 +65,10 @@
  * the Lua plugin will return its own info (i.e., "janus.plugin.lua", etc.).
  * Most of the times, Lua scripts will not need to override this information,
  * unless they really want to register their own name spaces and versioning.
+ * Finally, Lua scripts can receive information on slow links via the
+ * \c slowLink() callback, in order to react accordingly: e.g., reduce
+ * the bitrate of a video sender if they, or their viewers, are experiencing
+ * issues.
  *
  * \section capi C interfaces
  *
@@ -279,6 +283,7 @@ static char *lua_script_package = NULL;
 static gboolean has_incoming_rtp = FALSE;
 static gboolean has_incoming_rtcp = FALSE;
 static gboolean has_incoming_data = FALSE;
+static gboolean has_slow_link = FALSE;
 /* Lua C scheduler (for coroutines) */
 static GThread *scheduler_thread = NULL;
 static void *janus_lua_scheduler(void *data);
@@ -1082,20 +1087,27 @@ int janus_lua_init(janus_callbacks *callback, const char *config_path) {
 
 	/* Read configuration */
 	char filename[255];
-	g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_LUA_PACKAGE);
+	g_snprintf(filename, 255, "%s/%s.jcfg", config_path, JANUS_LUA_PACKAGE);
 	JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
 	janus_config *config = janus_config_parse(filename);
+	if(config == NULL) {
+		JANUS_LOG(LOG_WARN, "Couldn't find .jcfg configuration file (%s), trying .cfg\n", JANUS_LUA_PACKAGE);
+		g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_LUA_PACKAGE);
+		JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+		config = janus_config_parse(filename);
+	}
 	if(config == NULL) {
 		/* No config means no Lua script */
 		JANUS_LOG(LOG_ERR, "Failed to load configuration file for Lua plugin...\n");
 		return -1;
 	}
 	janus_config_print(config);
+	janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
 	char *lua_folder = NULL;
-	janus_config_item *folder = janus_config_get_item_drilldown(config, "general", "path");
+	janus_config_item *folder = janus_config_get(config, config_general, janus_config_type_item, "path");
 	if(folder && folder->value)
 		lua_folder = g_strdup(folder->value);
-	janus_config_item *script = janus_config_get_item_drilldown(config, "general", "script");
+	janus_config_item *script = janus_config_get(config, config_general, janus_config_type_item, "script");
 	if(script == NULL || script->value == NULL) {
 		JANUS_LOG(LOG_ERR, "Missing script path in Lua plugin configuration...\n");
 		janus_config_destroy(config);
@@ -1104,7 +1116,7 @@ int janus_lua_init(janus_callbacks *callback, const char *config_path) {
 	}
 	char *lua_file = g_strdup(script->value);
 	char *lua_config = NULL;
-	janus_config_item *conf = janus_config_get_item_drilldown(config, "general", "config");
+	janus_config_item *conf = janus_config_get(config, config_general, janus_config_type_item, "config");
 	if(conf && conf->value)
 		lua_config = g_strdup(conf->value);
 	janus_config_destroy(config);
@@ -1200,6 +1212,9 @@ int janus_lua_init(janus_callbacks *callback, const char *config_path) {
 	lua_getglobal(lua_state, "incomingData");
 	if(lua_isfunction(lua_state, lua_gettop(lua_state)) != 0)
 		has_incoming_data = TRUE;
+	lua_getglobal(lua_state, "slowLink");
+	if(lua_isfunction(lua_state, lua_gettop(lua_state)) != 0)
+		has_slow_link = TRUE;
 
 	lua_sessions = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)janus_lua_session_destroy);
 	lua_ids = g_hash_table_new(NULL, NULL);
@@ -1239,7 +1254,7 @@ int janus_lua_init(janus_callbacks *callback, const char *config_path) {
 		return -1;
 	}
 
-	/* This is the callback we'll need to invoke to contact the gateway */
+	/* This is the callback we'll need to invoke to contact the Janus core */
 	janus_core = callback;
 
 	/* Init the Lua script, in case it's needed */
@@ -1320,12 +1335,11 @@ int janus_lua_get_version(void) {
 	/* Check if the Lua script wants to override this method and return info itself */
 	if(has_get_version) {
 		/* Yep, pass the request to the Lua script and return the info */
-		janus_mutex_lock(&lua_mutex);
-		/* Unless we asked already */
 		if(lua_script_version != -1) {
-			janus_mutex_unlock(&lua_mutex);
+			/* Unless we asked already */
 			return lua_script_version;
 		}
+		janus_mutex_lock(&lua_mutex);
 		lua_State *t = lua_newthread(lua_state);
 		lua_getglobal(t, "getVersion");
 		lua_call(t, 0, 1);
@@ -1342,12 +1356,11 @@ const char *janus_lua_get_version_string(void) {
 	/* Check if the Lua script wants to override this method and return info itself */
 	if(has_get_version_string) {
 		/* Yep, pass the request to the Lua script and return the info */
-		janus_mutex_lock(&lua_mutex);
-		/* Unless we asked already */
 		if(lua_script_version_string != NULL) {
-			janus_mutex_unlock(&lua_mutex);
+			/* Unless we asked already */
 			return lua_script_version_string;
 		}
+		janus_mutex_lock(&lua_mutex);
 		lua_State *t = lua_newthread(lua_state);
 		lua_getglobal(t, "getVersionString");
 		lua_call(t, 0, 1);
@@ -1366,12 +1379,11 @@ const char *janus_lua_get_description(void) {
 	/* Check if the Lua script wants to override this method and return info itself */
 	if(has_get_description) {
 		/* Yep, pass the request to the Lua script and return the info */
-		janus_mutex_lock(&lua_mutex);
-		/* Unless we asked already */
 		if(lua_script_description != NULL) {
-			janus_mutex_unlock(&lua_mutex);
+			/* Unless we asked already */
 			return lua_script_description;
 		}
+		janus_mutex_lock(&lua_mutex);
 		lua_State *t = lua_newthread(lua_state);
 		lua_getglobal(t, "getDescription");
 		lua_call(t, 0, 1);
@@ -1390,12 +1402,11 @@ const char *janus_lua_get_name(void) {
 	/* Check if the Lua script wants to override this method and return info itself */
 	if(has_get_name) {
 		/* Yep, pass the request to the Lua script and return the info */
-		janus_mutex_lock(&lua_mutex);
-		/* Unless we asked already */
 		if(lua_script_name != NULL) {
-			janus_mutex_unlock(&lua_mutex);
+			/* Unless we asked already */
 			return lua_script_name;
 		}
+		janus_mutex_lock(&lua_mutex);
 		lua_State *t = lua_newthread(lua_state);
 		lua_getglobal(t, "getName");
 		lua_call(t, 0, 1);
@@ -1414,12 +1425,11 @@ const char *janus_lua_get_author(void) {
 	/* Check if the Lua script wants to override this method and return info itself */
 	if(has_get_author) {
 		/* Yep, pass the request to the Lua script and return the info */
-		janus_mutex_lock(&lua_mutex);
-		/* Unless we asked already */
 		if(lua_script_author != NULL) {
-			janus_mutex_unlock(&lua_mutex);
+			/* Unless we asked already */
 			return lua_script_author;
 		}
+		janus_mutex_lock(&lua_mutex);
 		lua_State *t = lua_newthread(lua_state);
 		lua_getglobal(t, "getAuthor");
 		lua_call(t, 0, 1);
@@ -1438,12 +1448,11 @@ const char *janus_lua_get_package(void) {
 	/* Check if the Lua script wants to override this method and return info itself */
 	if(has_get_package) {
 		/* Yep, pass the request to the Lua script and return the info */
-		janus_mutex_lock(&lua_mutex);
-		/* Unless we asked already */
 		if(lua_script_package != NULL) {
-			janus_mutex_unlock(&lua_mutex);
+			/* Unless we asked already */
 			return lua_script_package;
 		}
+		janus_mutex_lock(&lua_mutex);
 		lua_State *t = lua_newthread(lua_state);
 		lua_getglobal(t, "getPackage");
 		lua_call(t, 0, 1);
@@ -1858,7 +1867,21 @@ void janus_lua_slow_link(janus_plugin_session *handle, int uplink, int video) {
 	janus_mutex_unlock(&lua_sessions_mutex);
 	if(g_atomic_int_get(&session->destroyed) || g_atomic_int_get(&session->hangingup))
 		return;
-	/* TODO Handle feedback depending on the logic the Lua script dictated */
+	/* Check if the Lua script wants to handle such events */
+	janus_refcount_increase(&session->ref);
+	if(has_slow_link) {
+		/* Notify the Lua script */
+		janus_mutex_lock(&lua_mutex);
+		lua_State *t = lua_newthread(lua_state);
+		lua_getglobal(t, "slowLink");
+		lua_pushnumber(t, session->id);
+		lua_pushboolean(t, uplink);
+		lua_pushboolean(t, video);
+		lua_call(t, 3, 0);
+		lua_pop(lua_state, 1);
+		janus_mutex_unlock(&lua_mutex);
+	}
+	janus_refcount_decrease(&session->ref);
 }
 
 void janus_lua_hangup_media(janus_plugin_session *handle) {

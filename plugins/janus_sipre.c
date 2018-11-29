@@ -15,7 +15,7 @@
  * SIP plugin. The API it exposes is exactly the same, meaning it should
  * be pretty straightforward to switch from one plugin to another on the
  * client side. The configuration file looks exactly the same as well.
- * As such, you can mostly refer to the \ref sip for both.
+ * As such, you can mostly refer to the \ref sipsofia for both.
  *
  * \section sipreapi SIPre Plugin API
  *
@@ -91,7 +91,7 @@
 /* Plugin information */
 #define JANUS_SIPRE_VERSION			1
 #define JANUS_SIPRE_VERSION_STRING	"0.0.1"
-#define JANUS_SIPRE_DESCRIPTION		"This is a simple SIP plugin for Janus (based on libre instead of Sofia), allowing WebRTC peers to register at a SIP server and call SIP user agents through the gateway."
+#define JANUS_SIPRE_DESCRIPTION		"This is a simple SIP plugin for Janus (based on libre instead of Sofia), allowing WebRTC peers to register at a SIP server and call SIP user agents through a Janus instance."
 #define JANUS_SIPRE_NAME			"JANUS SIPre plugin"
 #define JANUS_SIPRE_AUTHOR			"Meetecho s.r.l."
 #define JANUS_SIPRE_PACKAGE			"janus.plugin.sipre"
@@ -166,7 +166,6 @@ static struct janus_json_parameter proxy_parameters[] = {
 };
 static struct janus_json_parameter call_parameters[] = {
 	{"uri", JANUS_JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
-	{"autoack", JANUS_JSON_BOOL, 0},
 	{"headers", JANUS_JSON_OBJECT, 0},
 	{"srtp", JANUS_JSON_STRING, 0},
 	{"srtp_profile", JSON_STRING, 0},
@@ -459,7 +458,6 @@ typedef struct janus_sipre_media {
 	gboolean earlymedia;
 	gboolean update;
 	gboolean ready;
-	gboolean autoack;
 	gboolean require_srtp, has_srtp_local, has_srtp_remote;
 	janus_srtp_profile srtp_profile;
 	gboolean on_hold;
@@ -805,7 +803,6 @@ static int janus_sipre_srtp_set_remote(janus_sipre_session *session, gboolean vi
 static void janus_sipre_srtp_cleanup(janus_sipre_session *session) {
 	if(session == NULL)
 		return;
-	session->media.autoack = TRUE;
 	session->media.require_srtp = FALSE;
 	session->media.has_srtp_local = FALSE;
 	session->media.has_srtp_remote = FALSE;
@@ -904,6 +901,7 @@ char *janus_sipre_sdp_manipulate(janus_sipre_session *session, janus_sdp *sdp, g
 /* Media */
 static int janus_sipre_allocate_local_ports(janus_sipre_session *session);
 static void *janus_sipre_relay_thread(void *data);
+static void janus_sipre_media_cleanup(janus_sipre_session *session);
 
 
 /* Error codes */
@@ -970,19 +968,26 @@ int janus_sipre_init(janus_callbacks *callback, const char *config_path) {
 
 	/* Read configuration */
 	char filename[255];
-	g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_SIPRE_PACKAGE);
+	g_snprintf(filename, 255, "%s/%s.jcfg", config_path, JANUS_SIPRE_PACKAGE);
 	JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
 	janus_config *config = janus_config_parse(filename);
+	if(config == NULL) {
+		JANUS_LOG(LOG_WARN, "Couldn't find .jcfg configuration file (%s), trying .cfg\n", JANUS_SIPRE_PACKAGE);
+		g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_SIPRE_PACKAGE);
+		JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+		config = janus_config_parse(filename);
+	}
 	if(config != NULL) {
 		janus_config_print(config);
 
-		janus_config_item *item = janus_config_get_item_drilldown(config, "general", "local_ip");
+		janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
+		janus_config_item *item = janus_config_get(config, config_general, janus_config_type_item, "local_ip");
 		if(item && item->value) {
 			/* Verify that the address is valid */
 			struct ifaddrs *ifas = NULL;
 			janus_network_address iface;
 			janus_network_address_string_buffer ibuf;
-			if(getifaddrs(&ifas) || ifas == NULL) {
+			if(getifaddrs(&ifas) == -1) {
 				JANUS_LOG(LOG_ERR, "Unable to acquire list of network devices/interfaces; some configurations may not work as expected...\n");
 			} else {
 				if(janus_network_lookup_interface(ifas, item->value, &iface) != 0) {
@@ -994,10 +999,11 @@ int janus_sipre_init(janus_callbacks *callback, const char *config_path) {
 						local_ip = g_strdup(janus_network_address_string_from_buffer(&ibuf));
 					}
 				}
+				freeifaddrs(ifas);
 			}
 		}
 
-		item = janus_config_get_item_drilldown(config, "general", "register_ttl");
+		item = janus_config_get(config, config_general, janus_config_type_item, "register_ttl");
 		if(item && item->value) {
 			register_ttl = atol(item->value);
 			if(register_ttl <= 0) {
@@ -1007,20 +1013,20 @@ int janus_sipre_init(janus_callbacks *callback, const char *config_path) {
 		}
 		JANUS_LOG(LOG_VERB, "SIPre registration TTL set to %d seconds\n", register_ttl);
 
-		item = janus_config_get_item_drilldown(config, "general", "behind_nat");
+		item = janus_config_get(config, config_general, janus_config_type_item, "behind_nat");
 		if(item && item->value) {
 			behind_nat = janus_is_true(item->value);
 		}
 
-		item = janus_config_get_item_drilldown(config, "general", "user_agent");
+		item = janus_config_get(config, config_general, janus_config_type_item, "user_agent");
 		if(item && item->value) {
 			user_agent = g_strdup(item->value);
 		} else {
-			user_agent = g_strdup("Janus WebRTC Gateway SIPre Plugin "JANUS_SIPRE_VERSION_STRING);
+			user_agent = g_strdup("Janus WebRTC Server SIPre Plugin "JANUS_SIPRE_VERSION_STRING);
 		}
 		JANUS_LOG(LOG_VERB, "SIPre User-Agent set to %s\n", user_agent);
 
-		item = janus_config_get_item_drilldown(config, "general", "rtp_port_range");
+		item = janus_config_get(config, config_general, janus_config_type_item, "rtp_port_range");
 		if(item && item->value) {
 			/* Split in min and max port */
 			char *maxport = strrchr(item->value, '-');
@@ -1042,7 +1048,7 @@ int janus_sipre_init(janus_callbacks *callback, const char *config_path) {
 			JANUS_LOG(LOG_VERB, "SIPre RTP/RTCP port range: %u -- %u\n", rtp_range_min, rtp_range_max);
 		}
 
-		item = janus_config_get_item_drilldown(config, "general", "events");
+		item = janus_config_get(config, config_general, janus_config_type_item, "events");
 		if(item != NULL && item->value != NULL) {
 			notify_events = janus_is_true(item->value);
 		}
@@ -1073,7 +1079,7 @@ int janus_sipre_init(janus_callbacks *callback, const char *config_path) {
 	identities = g_hash_table_new(g_str_hash, g_str_equal);
 	janus_mutex_init(&sessions_mutex);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_sipre_message_free);
-	/* This is the callback we'll need to invoke to contact the gateway */
+	/* This is the callback we'll need to invoke to contact the Janus core */
 	gateway = callback;
 
 	g_atomic_int_set(&initialized, 1);
@@ -1215,7 +1221,6 @@ void janus_sipre_create_session(janus_plugin_session *handle, int *error) {
 	session->media.earlymedia = FALSE;
 	session->media.update = FALSE;
 	session->media.ready = FALSE;
-	session->media.autoack = TRUE;
 	session->media.require_srtp = FALSE;
 	session->media.has_srtp_local = FALSE;
 	session->media.has_srtp_remote = FALSE;
@@ -1314,7 +1319,6 @@ json_t *janus_sipre_query_session(janus_plugin_session *handle) {
 	json_object_set_new(info, "call_status", json_string(janus_sipre_call_status_string(session->status)));
 	if(session->callee) {
 		json_object_set_new(info, "callee", json_string(session->callee ? session->callee : "??"));
-		json_object_set_new(info, "auto-ack", json_string(session->media.autoack ? "yes" : "no"));
 		json_object_set_new(info, "srtp-required", json_string(session->media.require_srtp ? "yes" : "no"));
 		json_object_set_new(info, "sdes-local", json_string(session->media.has_srtp_local ? "yes" : "no"));
 		json_object_set_new(info, "sdes-remote", json_string(session->media.has_srtp_remote ? "yes" : "no"));
@@ -1466,7 +1470,7 @@ void janus_sipre_incoming_rtcp(janus_plugin_session *handle, int video, char *bu
 		/* Forward to our SIPre peer */
 		if((video && session->media.has_video && session->media.video_rtcp_fd != -1) ||
 				(!video && session->media.has_audio && session->media.audio_rtcp_fd != -1)) {
-			/* Fix SSRCs as the gateway does */
+			/* Fix SSRCs as the Janus core does */
 			JANUS_LOG(LOG_HUGE, "[SIPre-%s] Fixing %s SSRCs (local %u, peer %u)\n",
 				session->account.username ? session->account.username : "unknown",
 				video ? "video" : "audio",
@@ -1557,21 +1561,28 @@ static void janus_sipre_hangup_media_internal(janus_plugin_session *handle) {
 	}
 	if(g_atomic_int_get(&session->destroyed))
 		return;
-	if(g_atomic_int_add(&session->hangingup, 1))
+	if(!g_atomic_int_compare_and_exchange(&session->hangingup, 0, 1))
 		return;
 	if(!(session->status == janus_sipre_call_status_inviting ||
 		 session->status == janus_sipre_call_status_invited ||
-		 session->status == janus_sipre_call_status_incall))
+		 session->status == janus_sipre_call_status_incall)) {
+		g_atomic_int_set(&session->hangingup, 0);
 		return;
+	}
 	session->media.ready = FALSE;
 	session->media.on_hold = FALSE;
 	session->status = janus_sipre_call_status_closing;
 	/* Enqueue the BYE */
 	mqueue_push(mq, janus_sipre_mqueue_event_do_bye, janus_sipre_mqueue_payload_create(session, NULL, 0, NULL));
+	/* Do cleanup if media thread has not been created */
+	if(!session->media.ready) {
+		janus_sipre_media_cleanup(session);
+	}
 	/* Get rid of the recorders, if available */
 	janus_mutex_lock(&session->rec_mutex);
 	janus_sipre_recorder_close(session, TRUE, TRUE, TRUE, TRUE);
 	janus_mutex_unlock(&session->rec_mutex);
+	g_atomic_int_set(&session->hangingup, 0);
 }
 
 /* Thread to handle incoming messages */
@@ -1922,9 +1933,6 @@ static void *janus_sipre_handler(void *data) {
 			json_t *uri = json_object_get(root, "uri");
 			json_t *secret = json_object_get(root, "secret");
 			json_t *authuser = json_object_get(root, "authuser");
-			/* Check if we need to ACK manually (e.g., for the Record-Route hack) */
-			json_t *autoack = json_object_get(root, "autoack");
-			gboolean do_autoack = autoack ? json_is_true(autoack) : TRUE;
 			/* Check if the INVITE needs to be enriched with custom headers */
 			char custom_headers[2048];
 			custom_headers[0] = '\0';
@@ -2105,7 +2113,6 @@ static void *janus_sipre_handler(void *data) {
 			session->callee = g_strdup(uri_text);
 			session->callid = g_strdup(callid);
 			g_hash_table_insert(callids, session->callid, session);
-			session->media.autoack = do_autoack;
 			session->temp_sdp = sdp;
 			mqueue_push(mq, janus_sipre_mqueue_event_do_call, janus_sipre_mqueue_payload_create(session, NULL, 0, data));
 			/* Done for now */
@@ -3135,6 +3142,41 @@ static void janus_sipre_connect_sockets(janus_sipre_session *session, struct soc
 
 }
 
+static void janus_sipre_media_cleanup(janus_sipre_session *session) {
+	if(session->media.audio_rtp_fd != -1) {
+		close(session->media.audio_rtp_fd);
+		session->media.audio_rtp_fd = -1;
+	}
+	if(session->media.audio_rtcp_fd != -1) {
+		close(session->media.audio_rtcp_fd);
+		session->media.audio_rtcp_fd = -1;
+	}
+	session->media.local_audio_rtp_port = 0;
+	session->media.local_audio_rtcp_port = 0;
+	session->media.audio_ssrc = 0;
+	if(session->media.video_rtp_fd != -1) {
+		close(session->media.video_rtp_fd);
+		session->media.video_rtp_fd = -1;
+	}
+	if(session->media.video_rtcp_fd != -1) {
+		close(session->media.video_rtcp_fd);
+		session->media.video_rtcp_fd = -1;
+	}
+	session->media.local_video_rtp_port = 0;
+	session->media.local_video_rtcp_port = 0;
+	session->media.video_ssrc = 0;
+	if(session->media.pipefd[0] > 0) {
+		close(session->media.pipefd[0]);
+		session->media.pipefd[0] = -1;
+	}
+	if(session->media.pipefd[1] > 0) {
+		close(session->media.pipefd[1]);
+		session->media.pipefd[1] = -1;
+	}
+	/* Clean up SRTP stuff, if needed */
+	janus_sipre_srtp_cleanup(session);
+}
+
 /* Thread to relay RTP/RTCP frames coming from the SIPre peer */
 static void *janus_sipre_relay_thread(void *data) {
 	janus_sipre_session *session = (janus_sipre_session *)data;
@@ -3287,12 +3329,7 @@ static void *janus_sipre_relay_thread(void *data) {
 				/* Can we assume it's pretty much over, after a POLLERR? */
 				goon = FALSE;
 				/* FIXME Simulate a "hangup" coming from the browser */
-				janus_sipre_message *msg = g_malloc(sizeof(janus_sipre_message));
-				msg->handle = session->handle;
-				msg->message = json_pack("{ss}", "request", "hangup");
-				msg->transaction = NULL;
-				msg->jsep = NULL;
-				g_async_queue_push(messages, msg);
+				janus_sipre_hangup_media(session->handle);
 				break;
 			} else if(fds[i].revents & POLLIN) {
 				if(pipe_fd != -1 && fds[i].fd == pipe_fd) {
@@ -3392,38 +3429,8 @@ static void *janus_sipre_relay_thread(void *data) {
 			}
 		}
 	}
-	if(session->media.audio_rtp_fd != -1) {
-		close(session->media.audio_rtp_fd);
-		session->media.audio_rtp_fd = -1;
-	}
-	if(session->media.audio_rtcp_fd != -1) {
-		close(session->media.audio_rtcp_fd);
-		session->media.audio_rtcp_fd = -1;
-	}
-	session->media.local_audio_rtp_port = 0;
-	session->media.local_audio_rtcp_port = 0;
-	session->media.audio_ssrc = 0;
-	if(session->media.video_rtp_fd != -1) {
-		close(session->media.video_rtp_fd);
-		session->media.video_rtp_fd = -1;
-	}
-	if(session->media.video_rtcp_fd != -1) {
-		close(session->media.video_rtcp_fd);
-		session->media.video_rtcp_fd = -1;
-	}
-	session->media.local_video_rtp_port = 0;
-	session->media.local_video_rtcp_port = 0;
-	session->media.video_ssrc = 0;
-	if(session->media.pipefd[0] > 0) {
-		close(session->media.pipefd[0]);
-		session->media.pipefd[0] = -1;
-	}
-	if(session->media.pipefd[1] > 0) {
-		close(session->media.pipefd[1]);
-		session->media.pipefd[1] = -1;
-	}
-	/* Clean up SRTP stuff, if needed */
-	janus_sipre_srtp_cleanup(session);
+	/* Cleanup the media session */
+	janus_sipre_media_cleanup(session);
 	/* Done */
 	JANUS_LOG(LOG_VERB, "Leaving SIPre relay thread\n");
 	janus_refcount_decrease(&session->ref);

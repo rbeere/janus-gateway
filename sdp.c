@@ -3,7 +3,7 @@
  * \copyright GNU General Public License v3
  * \brief    SDP processing
  * \details  Implementation of an SDP
- * parser/merger/generator in the gateway. Each SDP coming from peers is
+ * parser/merger/generator in the server. Each SDP coming from peers is
  * stripped/anonymized before it is passed to the plugins: all
  * DTLS/ICE/transport related information is removed, only leaving the
  * relevant information in place. SDP coming from plugins is stripped/anonymized
@@ -16,21 +16,25 @@
  * \ref protocols
  */
 
+#include <netdb.h>
+
 #include "janus.h"
 #include "ice.h"
 #include "sdp.h"
 #include "utils.h"
+#include "ip-utils.h"
 #include "debug.h"
 #include "events.h"
 
 
 /* Pre-parse SDP: is this SDP valid? how many audio/video lines? any features to take into account? */
-janus_sdp *janus_sdp_preparse(const char *jsep_sdp, char *error_str, size_t errlen,
+janus_sdp *janus_sdp_preparse(void *ice_handle, const char *jsep_sdp, char *error_str, size_t errlen,
 		int *audio, int *video, int *data) {
-	if(!jsep_sdp || !audio || !video || !data) {
+	if(!ice_handle || !jsep_sdp || !audio || !video || !data) {
 		JANUS_LOG(LOG_ERR, "  Can't preparse, invalid arguments\n");
 		return NULL;
 	}
+	janus_ice_handle *handle = (janus_ice_handle *)ice_handle;
 	janus_sdp *parsed_sdp = janus_sdp_parse(jsep_sdp, error_str, errlen);
 	if(!parsed_sdp) {
 		JANUS_LOG(LOG_ERR, "  Error parsing SDP? %s\n", error_str ? error_str : "(unknown reason)");
@@ -45,6 +49,30 @@ janus_sdp *janus_sdp_preparse(const char *jsep_sdp, char *error_str, size_t errl
 			*audio = *audio + 1;
 		} else if(m->type == JANUS_SDP_VIDEO && m->port > 0) {
 			*video = *video + 1;
+		}
+		/* Preparse the mid as well */
+		GList *tempA = m->attributes;
+		while(tempA) {
+			janus_sdp_attribute *a = (janus_sdp_attribute *)tempA->data;
+			if(a->name) {
+				if(!strcasecmp(a->name, "mid")) {
+					/* Found mid attribute */
+					if(m->type == JANUS_SDP_AUDIO && m->port > 0) {
+						JANUS_LOG(LOG_VERB, "[%"SCNu64"] Audio mid: %s\n", handle->handle_id, a->value);
+						if(handle->audio_mid == NULL)
+							handle->audio_mid = g_strdup(a->value);
+						if(handle->stream_mid == NULL)
+							handle->stream_mid = handle->audio_mid;
+					} else if(m->type == JANUS_SDP_VIDEO && m->port > 0) {
+						JANUS_LOG(LOG_VERB, "[%"SCNu64"] Video mid: %s\n", handle->handle_id, a->value);
+						if(handle->video_mid == NULL)
+							handle->video_mid = g_strdup(a->value);
+						if(handle->stream_mid == NULL)
+							handle->stream_mid = handle->video_mid;
+					}
+				}
+			}
+			tempA = tempA->next;
 		}
 		temp = temp->next;
 	}
@@ -579,9 +607,9 @@ int janus_sdp_parse_candidate(void *ice_stream, const char *candidate, int trick
 		/* Skipping the 'candidate:' prefix Firefox puts in trickle candidates */
 		candidate += strlen("candidate:");
 	}
-	char rfoundation[32], rtransport[4], rip[40], rtype[6], rrelip[40];
+	char rfoundation[33], rtransport[4], rip[50], rtype[6], rrelip[40];
 	guint32 rcomponent, rpriority, rport, rrelport;
-	int res = sscanf(candidate, "%31s %30u %3s %30u %39s %30u typ %5s %*s %39s %*s %30u",
+	int res = sscanf(candidate, "%32s %30u %3s %30u %49s %30u typ %5s %*s %39s %*s %30u",
 		rfoundation, &rcomponent, rtransport, &rpriority,
 			rip, &rport, rtype, rrelip, &rrelport);
 	if(res < 7) {
@@ -592,6 +620,26 @@ int janus_sdp_parse_candidate(void *ice_stream, const char *candidate, int trick
 		}
 	}
 	if(res >= 7) {
+		if(strstr(rip, ".local")) {
+			/* The IP is actually an mDNS address, try to resolve it
+			 * https://tools.ietf.org/html/draft-ietf-rtcweb-mdns-ice-candidates-00 */
+			struct addrinfo *info = NULL;
+			janus_network_address addr;
+			janus_network_address_string_buffer addr_buf;
+			if(getaddrinfo(rip, NULL, NULL, &info) != 0 ||
+					janus_network_address_from_sockaddr(info->ai_addr, &addr) != 0 ||
+					janus_network_address_to_string_buffer(&addr, &addr_buf) != 0) {
+				JANUS_LOG(LOG_WARN, "[%"SCNu64"] Couldn't resolve mDNS address (%s), dropping candidate\n",
+					handle->handle_id, rip);
+				if(info)
+					freeaddrinfo(info);
+				return res;
+			}
+			freeaddrinfo(info);
+			JANUS_LOG(LOG_WARN, "[%"SCNu64"] mDNS address (%s) resolved: %s\n",
+				handle->handle_id, rip, janus_network_address_string_from_buffer(&addr_buf));
+			g_strlcpy(rip, janus_network_address_string_from_buffer(&addr_buf), sizeof(rip));
+		}
 		/* Add remote candidate */
 		component = stream->component;
 		if(component == NULL || rcomponent > 1) {
@@ -1064,25 +1112,25 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 	GList *temp = anon->m_lines;
 	while(temp) {
 		janus_sdp_mline *m = (janus_sdp_mline *)temp->data;
-		if(m->type == JANUS_SDP_AUDIO && m->port > 0) {
+		if(m->type == JANUS_SDP_AUDIO) {
 			audio++;
 			if(audio == 1) {
 				g_snprintf(buffer_part, sizeof(buffer_part),
 					" %s", handle->audio_mid ? handle->audio_mid : "audio");
 				g_strlcat(buffer, buffer_part, JANUS_BUFSIZE);
 			}
-		} else if(m->type == JANUS_SDP_VIDEO && m->port > 0) {
+		} else if(m->type == JANUS_SDP_VIDEO) {
 			video++;
-			if(video) {
+			if(video == 1) {
 				g_snprintf(buffer_part, sizeof(buffer_part),
 					" %s", handle->video_mid ? handle->video_mid : "video");
 				g_strlcat(buffer, buffer_part, JANUS_BUFSIZE);
 			}
 #ifdef HAVE_SCTP
-		} else if(m->type == JANUS_SDP_APPLICATION && m->port > 0) {
+		} else if(m->type == JANUS_SDP_APPLICATION) {
 			if(m->proto && (!strcasecmp(m->proto, "DTLS/SCTP") || !strcasecmp(m->proto, "UDP/DTLS/SCTP")))
 				data++;
-			if(data) {
+			if(data == 1) {
 				g_snprintf(buffer_part, sizeof(buffer_part),
 					" %s", handle->data_mid ? handle->data_mid : "data");
 				g_strlcat(buffer, buffer_part, JANUS_BUFSIZE);
@@ -1239,14 +1287,14 @@ char *janus_sdp_merge(void *ice_handle, janus_sdp *anon, gboolean offer) {
 			continue;
 		}
 		/* a=mid:(audio|video|data) */
-		if(m->type == JANUS_SDP_AUDIO) {
+		if(m->type == JANUS_SDP_AUDIO && audio == 1) {
 			a = janus_sdp_attribute_create("mid", "%s", handle->audio_mid);
 			m->attributes = g_list_insert_before(m->attributes, first, a);
-		} else if(m->type == JANUS_SDP_VIDEO) {
+		} else if(m->type == JANUS_SDP_VIDEO && video == 1) {
 			a = janus_sdp_attribute_create("mid", "%s", handle->video_mid);
 			m->attributes = g_list_insert_before(m->attributes, first, a);
 #ifdef HAVE_SCTP
-		} else if(m->type == JANUS_SDP_APPLICATION) {
+		} else if(m->type == JANUS_SDP_APPLICATION && data == 1) {
 			if(!strcasecmp(m->proto, "UDP/DTLS/SCTP"))
 				janus_flags_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_NEW_DATACHAN_SDP);
 			if(!janus_flags_is_set(&handle->webrtc_flags, JANUS_ICE_HANDLE_WEBRTC_NEW_DATACHAN_SDP)) {
