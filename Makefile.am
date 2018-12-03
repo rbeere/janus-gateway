@@ -401,8 +401,8 @@ plugins_libjanus_sip_la_SOURCES = plugins/janus_sip.c plugins/ulawalaw.c
 plugins_libjanus_sip_la_CFLAGS = $(plugins_cflags) $(SOFIA_CFLAGS) $(OPUS_CFLAGS)
 plugins_libjanus_sip_la_LDFLAGS = $(plugins_ldflags) $(SOFIA_LDFLAGS) $(SOFIA_LIBS) $(OPUS_LIBS)
 plugins_libjanus_sip_la_LIBADD = $(plugins_libadd) $(SOFIA_LIBADD) $(OPUS_LIBADD)
-conf_DATA += conf/janus.plugin.sip.cfg.sample
-EXTRA_DIST += conf/janus.plugin.sip.cfg.sample
+conf_DATA += conf/janus.plugin.sip.jcfg.sample
+EXTRA_DIST += conf/janus.plugin.sip.jcfg.sample
 endif
 
 if ENABLE_PLUGIN_SIPRE
